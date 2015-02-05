@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 
 import argparse
+from logging import INFO, DEBUG, WARN
 from pprint import pformat
-from execo import Remote, logger, Process, SshProcess
+from execo import Remote, logger, Process, SshProcess, configuration
 from execo.log import style
 from execo_g5k import get_g5k_sites, get_current_oar_jobs, get_planning,\
     compute_slots, find_free_slot, distribute_hosts, get_jobs_specs, \
     oarsub, get_oar_job_info, wait_oar_job_start, get_oar_job_nodes, \
-    get_oar_job_subnets, Deployment, deploy
+    get_oar_job_subnets, Deployment, deploy, get_host_site, \
+    default_frontend_connection_params
 from execo_g5k.planning import show_resources
 from execo.time_utils import format_date
 from vm5k.utils import hosts_list
@@ -17,10 +19,16 @@ default_walltime  = '2:00:00'
 default_n_nodes = 10
 default_site = 'nancy'
 
+configuration['color_styles']['step'] = 'on_yellow', 'bold'
+
 def main():
+    logger.info(style.step(' Launching deployment of a Google Datacenter '))
     args = set_options()
+    logger.info(style.log_header('Retrieve Grid\'5000 resources'))
     hosts, vnet = get_resources(args.site, args.nodes, args.walltime, default_job_name)
+    logger.info(style.log_header('Configure hosts'))
     setup_hosts(hosts)
+    logger.info(style.log_header('Create virtual nodes'))
     
 
 def set_options():
@@ -44,6 +52,12 @@ def set_options():
                         default=default_walltime,
                         help="Walltime for the OAR job")
     args = parser.parse_args()
+    if args.verbose:
+        logger.setLevel(DEBUG)
+    elif args.quiet:
+        logger.setLevel(WARN)
+    else:
+        logger.setLevel(INFO)
     return args
 
 
@@ -67,7 +81,6 @@ def get_resources(site=None, n_nodes=None, walltime=None, job_name=None):
     wait_oar_job_start(job_id, site)
     hosts = get_oar_job_nodes(job_id, site)
     logger.info('Hosts: %s', hosts_list(hosts))
-    
     vnet = get_oar_job_subnets(job_id, site)[1]['ip_prefix']
     logger.info('Virtual Network: %s', vnet)
     
@@ -76,19 +89,22 @@ def get_resources(site=None, n_nodes=None, walltime=None, job_name=None):
 def setup_hosts(hosts):
     """ """
     logger.info('Deploying hosts')
-    hosts, _ = deploy(Deployment(hosts=hosts,
+    deployed_hosts, _ = deploy(Deployment(hosts=hosts,
                                           env_name="wheezy-x64-nfs"))
+    hosts = list(deployed_hosts)
     f = open('nodes.txt' ,'w')
     f.write('\n'.join(hosts))
     f.close()
-    logger.info('Lauching distem installation')
-    distem_install = Process('distem-bootstrap -f nodes.txt --no-init-pnodes').run()
-    logger.info('Configuring coordinator')
+    logger.info('Performing distem installation')
+    distem_install = SshProcess('distem-bootstrap -f nodes.txt',
+                                get_host_site(hosts[0]),
+                                connection_params={'user': 
+                                                   default_frontend_connection_params['user']}).run()
+
+    logger.info('Configuring coordinator and pnodes')
     coord_init = SshProcess('distem --coordinator host=%s '
-                            '--init-pnode %' % (hosts[0], hosts[0], ), hosts[0]).run()
+                            '--init-pnode %s' % (hosts[0], ','.join(hosts), ), hosts[0]).run()
     print coord_init.stdout
-    
-    
     
     
 
