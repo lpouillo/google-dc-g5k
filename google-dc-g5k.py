@@ -16,10 +16,14 @@ from execo_g5k.planning import show_resources
 from execo.time_utils import format_date
 from vm5k.utils import hosts_list
 
+
 default_job_name = 'GoogleDataCenter'
 default_walltime  = '2:00:00'
-default_n_nodes = 10
 default_site = 'nancy'
+default_n_pnodes = 10
+default_n_vnodes = 100
+default_root_fs = 'file:///home/ejeanvoine/public/distem/distem-fs-wheezy.tar.gz'
+
 
 configuration['color_styles']['step'] = 'on_yellow', 'bold'
 
@@ -27,11 +31,11 @@ def main():
     logger.info('%s\n', style.step(' Launching deployment of a Google Datacenter '))
     args = set_options()
     logger.info(style.step('Retrieve Grid\'5000 resources'))
-    hosts, vnet = get_resources(args.site, args.nodes, args.walltime, default_job_name)
-    logger.info(style.step('Configure distem on hosts'))
-    setup_distem(hosts, vnet)
-    logger.info(style.log_header('Create virtual nodes'))
-    
+    hosts, vnet = get_resources(args.site, args.pnodes, args.walltime, default_job_name)
+    logger.info(style.step('Configure distem on physical hosts'))
+    coordinator = setup_distem(hosts, vnet)
+    logger.info(style.step('Create virtual nodes'))
+    setup_vnodes(coordinator, args.vnodes, hosts)
 
 def set_options():
     """ """
@@ -46,10 +50,14 @@ def set_options():
     parser.add_argument("-s", "--site",
                         default=default_site,
                         help="site on which job will be run")
-    parser.add_argument("-n", "--nodes",
+    parser.add_argument("-np", "--pnodes",
                         type=int,
-                        default=default_n_nodes,
-                        help="number of nodes dedicated to OpenStack")
+                        default=default_n_pnodes,
+                        help="number of physical nodes to be reserved")
+    parser.add_argument("-nv", "--vnodes",
+                        type=int,
+                        default=default_n_vnodes,
+                        help="number of virtual nodes to be created")
     parser.add_argument("-w", "--walltime",
                         default=default_walltime,
                         help="Walltime for the OAR job")
@@ -82,6 +90,10 @@ def get_resources(site=None, n_nodes=None, walltime=None, job_name=None):
     logger.info('Waiting for job start ...')
     wait_oar_job_start(job_id, site)
     hosts = get_oar_job_nodes(job_id, site)
+    if len(hosts) != n_nodes:
+        logger.error('Number of hosts %s in running job does not match wanted'
+        ' number of physical nodes %s', len(hosts), n_nodes)
+        exit()
     logger.info('Hosts: %s', hosts_list(hosts))
     vnet = get_oar_job_subnets(job_id, site)[1]['ip_prefix']
     logger.info('Virtual Network: %s', vnet)
@@ -94,16 +106,17 @@ def setup_distem(hosts, vnet):
     logger.info('Deploying hosts')
     deployed_hosts, _ = deploy(Deployment(hosts=hosts,
                                           env_name="wheezy-x64-nfs"))
-    hosts = list(deployed_hosts)
+    hosts = sorted(list(deployed_hosts), key=lambda host: (host.split('.', 1)[0].split('-')[0],
+                                    int(host.split('.', 1)[0].split('-')[1])))
     coordinator = hosts[0]
     fd, nodes_file = mkstemp(dir='/tmp/', prefix='distem_nodes_')
     f = fdopen(fd, 'w')
     f.write('\n'.join(hosts))
     f.close()
     
-    Put(get_host_site(hosts[0]), [nodes_file], remote_location='/tmp/',
+    Put(get_host_site(coordinator), [nodes_file], remote_location='/tmp/',
         connection_params={'user': default_frontend_connection_params['user']}).run()
-    logger.info('Performing distem installation')    
+    logger.info('Performing distem bootstrap')    
     distem_install = SshProcess('distem-bootstrap -f ' + nodes_file,
                                 get_host_site(hosts[0]),
                                 connection_params={'user': 
@@ -114,8 +127,33 @@ def setup_distem(hosts, vnet):
                              '--create-vnetwork vnetwork=vnetwork,address=%s'
                              % (coordinator, vnet),
                                 coordinator).run()
+    logger.info('Distem is ready to be used on %s', style.emph(coordinator))
+    return coordinator
+
+def setup_vnodes(coordinator, n_nodes=None, hosts=None):
+    """ """
+    n_by_host = int(n_nodes / len(hosts))
+    logger.info('Create the vnodes')    
+    cmd = '; '.join('; '.join('distem --create-vnode vnode=node-' + str(i * n_by_host + j +1) +
+                       ',pnode=' + host.address + ',' + \
+                       'rootfs=file:///home/ejeanvoine/public/distem/distem-fs-wheezy.tar.gz'
+                       for j in range(n_by_host)) 
+                    for i, host in enumerate(hosts))
+    SshProcess(cmd, coordinator).run()
+                
+    logger.info('Create the network interfaces')
+    cmd = '; '.join('; '.join('distem --create-viface vnode=node-' + str(i * n_by_host + j +1) +
+                              ',iface=if0,vnetwork=vnetwork' 
+                              for j in range(n_by_host)) 
+                    for i, host in enumerate(hosts))
+    SshProcess(cmd, coordinator).run()
     
-    
+    logger.info('Start the vnodes')
+    cmd = '; '.join('; '.join('distem --start-vnode node-' + str(i * n_by_host + j +1) 
+                              for j in range(n_by_host)) 
+                    for i, host in enumerate(hosts))
+    SshProcess(cmd, coordinator).run()        
+            
     
 
 def _make_reservation(site=None, n_nodes=None,
