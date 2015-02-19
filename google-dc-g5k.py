@@ -140,9 +140,13 @@ def setup_vnodes(coordinator, n_nodes=None, hosts=None):
                        'distem --create-viface vnode=node-$i_node,iface=if0,vnetwork=vnetwork ; '
                        'distem --start-vnode node-$i_node')
     cmds = [base_cmd.substitute(i_node=i * n_by_host + j + 1, host=host.address) 
-            for j in range(n_by_host)
-            for i, host in enumerate(hosts)]
-    TaktukRemote('{{cmds}}', [coordinator] * len(cmds)).run()
+            for i, host in enumerate(hosts)
+            for j in range(n_by_host)]
+    chunk_size = 50
+    # Distem is saturating around 75 parallel request so we split
+    for chunk in [cmds[x : x + chunk_size] for x in xrange(0, len(cmds), chunk_size)]:
+        TaktukRemote('{{chunk}}', [coordinator] * len(chunk)).run()
+        logger.info('%s vnodes have been started', chunk_size)
     
 
 def _make_reservation(site=None, n_nodes=None, walltime=None, job_name=None):
