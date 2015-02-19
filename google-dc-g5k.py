@@ -2,10 +2,11 @@
 
 import argparse
 from os import fdopen
+from string import Template
 from tempfile import mkstemp
 from logging import INFO, DEBUG, WARN
 from pprint import pformat
-from execo import Remote, logger, Process, SshProcess, configuration, Put
+from execo import Remote, TaktukRemote, logger, Process, SshProcess, configuration, Put
 from execo.log import style
 from execo_g5k import get_g5k_sites, get_current_oar_jobs, get_planning,\
     compute_slots, find_free_slot, distribute_hosts, get_jobs_specs, \
@@ -93,7 +94,7 @@ def get_resources(site=None, n_nodes=None, walltime=None, job_name=None):
     if len(hosts) != n_nodes:
         logger.error('Number of hosts %s in running job does not match wanted'
         ' number of physical nodes %s', len(hosts), n_nodes)
-        exit()
+        
     logger.info('Hosts: %s', hosts_list(hosts))
     vnet = get_oar_job_subnets(job_id, site)[1]['ip_prefix']
     logger.info('Virtual Network: %s', vnet)
@@ -132,29 +133,16 @@ def setup_distem(hosts, vnet):
 
 def setup_vnodes(coordinator, n_nodes=None, hosts=None):
     """ """
-    n_by_host = int(n_nodes / len(hosts))
-    logger.info('Create the vnodes')    
-    cmd = '; '.join('; '.join('distem --create-vnode vnode=node-' + str(i * n_by_host + j +1) +
-                       ',pnode=' + host.address + ',' + \
-                       'rootfs=file:///home/ejeanvoine/public/distem/distem-fs-wheezy.tar.gz'
-                       for j in range(n_by_host)) 
-                    for i, host in enumerate(hosts))
-    SshProcess(cmd, coordinator).run()
-                
-    logger.info('Create the network interfaces')
-    cmd = '; '.join('; '.join('distem --create-viface vnode=node-' + str(i * n_by_host + j +1) +
-                              ',iface=if0,vnetwork=vnetwork' 
-                              for j in range(n_by_host)) 
-                    for i, host in enumerate(hosts))
-    SshProcess(cmd, coordinator).run()
-    
-    logger.info('Start the vnodes')
-    cmd = '; '.join('; '.join('distem --start-vnode node-' + str(i * n_by_host + j +1) 
-                              for j in range(n_by_host)) 
-                    for i, host in enumerate(hosts))
-    SshProcess(cmd, coordinator).run()     
-       
-            
+    logger.info('Create the vnodes')
+    n_by_host = int(n_nodes / len(hosts))  
+    base_cmd = Template('distem --create-vnode vnode=node-$i_node,pnode=$host,'
+                       'rootfs=file:///home/ejeanvoine/public/distem/distem-fs-wheezy.tar.gz ; '
+                       'distem --create-viface vnode=node-$i_node,iface=if0,vnetwork=vnetwork ; '
+                       'distem --start-vnode node-$i_node')
+    cmds = [base_cmd.substitute(i_node=i * n_by_host + j + 1, host=host.address) 
+            for j in range(n_by_host)
+            for i, host in enumerate(hosts)]
+    TaktukRemote('{{cmds}}', [coordinator] * len(cmds)).run()
     
 
 def _make_reservation(site=None, n_nodes=None, walltime=None, job_name=None):
