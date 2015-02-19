@@ -85,7 +85,7 @@ def get_resources(site=None, n_nodes=None, walltime=None, job_name=None):
             break
     if not job_id:
         logger.info('Performing a new reservation')
-        job_id = _make_reservation(site, n_nodes, walltime)
+        job_id = _make_reservation(site, n_nodes, walltime, job_name)
 
     logger.info('Waiting for job start ...')
     wait_oar_job_start(job_id, site)
@@ -152,12 +152,12 @@ def setup_vnodes(coordinator, n_nodes=None, hosts=None):
     cmd = '; '.join('; '.join('distem --start-vnode node-' + str(i * n_by_host + j +1) 
                               for j in range(n_by_host)) 
                     for i, host in enumerate(hosts))
-    SshProcess(cmd, coordinator).run()        
+    SshProcess(cmd, coordinator).run()     
+       
             
     
 
-def _make_reservation(site=None, n_nodes=None,
-                      walltime=None):
+def _make_reservation(site=None, n_nodes=None, walltime=None, job_name=None):
     """ """
     elements = {site: n_nodes}
     logger.detail(pformat(elements))
@@ -175,7 +175,7 @@ def _make_reservation(site=None, n_nodes=None,
 
     show_resources(resources)    
     
-    jobs_specs = get_jobs_specs(resources, name=default_job_name,
+    jobs_specs = get_jobs_specs(resources, name=job_name,
                                 excluded_elements=blacklisted)
     sub, site = jobs_specs[0]
     sub.resources = 'slash_22=1+' + sub.resources
