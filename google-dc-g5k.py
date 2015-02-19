@@ -146,8 +146,10 @@ def setup_vnodes(coordinator, n_nodes=None, hosts=None):
     # Distem is saturating around 75 parallel request so we split
     for chunk in [cmds[x : x + chunk_size] for x in xrange(0, len(cmds), chunk_size)]:
         TaktukRemote('{{chunk}}', [coordinator] * len(chunk)).run()
-        logger.info('%s vnodes have been started', chunk_size)
-    
+        logger.detail('%s vnodes have been started', chunk_size)
+        
+    logger.info('All vnodes are ready to be used')
+
 
 def _make_reservation(site=None, n_nodes=None, walltime=None, job_name=None):
     """ """
