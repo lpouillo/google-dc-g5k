@@ -1,10 +1,11 @@
 # google-dc-g5k
 
 Setup a virtual datacenter using execo and distem and injects faults into the system, 
-using various events generator (googleclusterdata, 
+using Google cluster data events. 
 
 
-= Installation =
+## Installation
+
 This module requires execo > 2.4.3.
   
   export http_proxy="http://proxy:3128" ; export https_proxy="https://proxy:3128" 
@@ -12,8 +13,10 @@ This module requires execo > 2.4.3.
   git clone https://github.com/lpouillo/google-dc-g5k.git
   
 
-= Usage =
+## Usage
 
-  google-dc-g5k.git -s lyon -np 20 -nv 500
+  google-dc-g5k -n 1000
 
-= Copyright =
+will deploy 1000 virtual nodes 
+
+## Licence 
