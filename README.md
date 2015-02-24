@@ -15,8 +15,11 @@ This module requires execo > 2.4.3.
 
 ## Usage
 
-  google-dc-g5k -n 1000
+  google-dc-g5k deploy -n 1000
+  
+will deploy 1000 virtual nodes.
 
-will deploy 1000 virtual nodes 
+  google-dc-g5k play -w 1:00:00
+ 
 
 ## Licence 

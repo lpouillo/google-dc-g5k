@@ -2,7 +2,7 @@
 
 import json
 import argparse
-import httplib2
+import requests
 import math
 from os import fdopen
 
@@ -26,33 +26,35 @@ from vm5k.utils import hosts_list, get_CPU_RAM_FLOPS
 
 default_job_name = 'GoogleDataCenter'
 default_walltime  = '2:00:00'
-default_site = 'nancy'
-default_n_vnodes = 1000
-default_vnodes_cpu = 1
-default_vnodes_mem = 256
+default_n_vnodes = 500
+default_vnodes_cpu = {"vcores": [{"id": "0", "pcore": "0", "frequency": "1000"}]}
+default_vnodes_mem = {"mem": "256 Mo", "swap": "256 Mo"}
+
 default_root_fs = 'file:///home/ejeanvoine/public/distem/distem-fs-wheezy.tar.gz'
 
 configuration['color_styles']['step'] = 'on_yellow', 'bold'
 
 def main():
-    """ Perform the following workflow 
-    * retrieve the resources from the options given in command line or from a json file
     """
-    logger.info('%s\n', style.step(' Launching deployment of a Google Datacenter '))
-    args = set_options()
     
+    """
+    logger.info('%s\n', style.step(' Playing with a Google Datacenter on Grid\'5000'))
+    args = set_options()
+    logger.info(style.step('Retrieve Grid\'5000 resources'))
+    hosts, vnet = get_resources(args.vnodes, args.vnodes_mem, args.walltime, args.job_name)
+    if not vnet or not hosts:
+        logger.error('Error in job resources')
+        exit()
     if args.action == 'deploy':
-        logger.info(style.step('Retrieve Grid\'5000 resources'))
-        hosts, vnet = get_resources(args.vnodes, args.vnodes_mem, args.walltime, args.job_name)
-        if not vnet or not hosts:
-            exit()
         logger.info(style.step('Configure distem on physical hosts'))    
-        coordinator = setup_distem(hosts, vnet, max_iface=math.ceil(args.vnodes / len(hosts)))
+        logger.debug('max_iface=%s', math.ceil(args.vnodes / len(hosts)))
+        coordinator = setup_distem(hosts, vnet,
+                                   max_iface=int(math.ceil(args.vnodes / len(hosts))))
         if not coordinator:
             logger.error('Problem with distem installation')
             exit()
         logger.info(style.step('Create virtual nodes'))
-        init_vnodes(coordinator, args.vnodes, hosts)
+        init_vnodes(coordinator, args.vnodes, args.vnodes_mem, args.vnodes_cpu)
     
     elif args.actions == 'play':
         logger.error('Not Implemented')
@@ -148,38 +150,87 @@ def setup_distem(hosts, vnet, max_iface):
         logger.error('No nodes deployed !')
         return None
     
-    logger.info('Performing distem bootstrap')
-    coordinator = hosts[0]
+    
     fd, nodes_file = mkstemp(dir='/tmp/', prefix='distem_nodes_')
     f = fdopen(fd, 'w')
     f.write('\n'.join(hosts))
-    f.close()    
-    Put(get_host_site(coordinator), [nodes_file], remote_location='/tmp/',
+    f.close()
+    
+    scan_hosts = Process('nmap -v -oG - -i ' + nodes_file + ' -p 4567 | grep open')
+    scan_hosts.shell = True
+    scan_hosts.nolog_exit_code = scan_hosts.ignore_exit_code = True
+    scan_hosts.run()
+    
+    if scan_hosts.stdout:
+        coordinator = scan_hosts.stdout[scan_hosts.stdout.find('(') + 1:
+                                        scan_hosts.stdout.find(')')]
+        logger.info('Existing instance found on %s, cleaning ..', 
+                    style.host(coordinator))
+        rest_url = "http://" + coordinator + ':4567'
+        r = requests.get(rest_url + '/vnodes/?')
+        for vnode in json.loads(r.content):
+            logger.detail('Destroying %s', vnode['name'])
+            r = requests.put(rest_url + '/vnodes/' + vnode['name'], 
+                              data={'type': 'remove'})
+        logger.info('Done')
+        exit()
+    else:
+        coordinator = hosts[0]
+        logger.info('Performing distem bootstrap ...')
+        Put(get_host_site(coordinator), [nodes_file], remote_location='/tmp/',
         connection_params={'user': default_frontend_connection_params['user']}).run()
-        
-    distem_install = SshProcess('distem-bootstrap --max-vifaces ' + str(max_iface) + 
-                                '  -f ' + nodes_file,
-                                get_host_site(hosts[0]),
-                                connection_params={'user': 
-                                                   default_frontend_connection_params['user']}).run()
-    if not distem_install.ok:
-        logger.error('Error in installing distem \n%s', distem_install.stdout)
-        return None
-    distem_vnet = SshProcess('distem --coordinator host=%s '
-                             '--create-vnetwork vnetwork=vnetwork,address=%s'
-                             % (coordinator, vnet),
-                                coordinator).run()
-    logger.info('Distem is ready to be used on %s', style.emph(coordinator))
-    
-    
+        distem_install = SshProcess('distem-bootstrap --max-vifaces ' + str(max_iface) + 
+                                    '  -f ' + nodes_file + ' -d -D --verbose',
+                                    get_host_site(coordinator),
+                                    connection_params={'user': default_frontend_connection_params['user']}).run()
+        if not distem_install.ok:
+            logger.error('Error in installing distem \n%s', distem_install.stdout)
+            return None
+        distem_vnet = SshProcess('distem --coordinator host=%s '
+                                 '--create-vnetwork vnetwork=vnetwork,address=%s'
+                                 % (coordinator, vnet),
+                                    coordinator).run()
+                                    
+        logger.info('Distem is ready to be used on %s', style.emph(coordinator))
     
     return coordinator
 
-def setup_vnodes(coordinator, n_nodes=None, hosts=None):
+def init_vnodes(coordinator, n_nodes=None, vmem=None, vcpu=None):
     """ """
+    rest_url = "http://" + coordinator + ":4567"
+    r = requests.get(rest_url + '/pnodes/')
+    pnodes = json.loads(r.content)
+    hosts = map(lambda x: x['address'], pnodes)
     logger.info('Create the %s vnodes', style.emph(n_nodes))
-    n_by_host = int(n_nodes / len(hosts))  
-    base_cmd = Template('distem --create-vnode vnode=node-$i_node'
+    n_by_host = int(n_nodes / len(hosts))
+
+    
+    vnodes = [{"id": "0",
+              "name": "node-" + str(i * n_by_host + j + 1),
+              "status": "INIT",
+              "vfilesystem": {"image": "file/home/ejeanvoine/public/distem/distem-fs-wheezy.tar.gz",
+                              "shared": False,
+                              "path": None,
+                              "sharedpath": None,
+                              "cow": False},
+               "vifaces": [{"name": "if0",
+                            "vnetwork": "vnetwork"}],
+               "vcpu": default_vnodes_cpu,
+               "vmem": default_vnodes_mem,
+               "host": host,
+               "ssh_key": None} 
+              for i, host in enumerate(hosts)
+              for j in range(n_by_host + 1 )]
+     
+    
+    from pprint import pprint
+    for vnode in vnodes:
+        r = requests.post(rest_url + '/vnodes/' + vnode['name'], 
+                          data={"desc": json.dumps(vnode)})
+
+    exit()
+    
+    base_cmd = Template('distem --create-vnode vnode=node-$i_node '
                        'rootfs=file:///home/ejeanvoine/public/distem/distem-fs-wheezy.tar.gz ; '
                        'distem --create-viface vnode=node-$i_node,iface=if0,vnetwork=vnetwork ; '
                        'distem --start-vnode node-$i_node')
@@ -192,9 +243,8 @@ def setup_vnodes(coordinator, n_nodes=None, hosts=None):
         TaktukRemote('{{chunk}}', [coordinator] * len(chunk)).run()
         logger.detail('%s vnodes have been started', chunk_size)
     
-    h = httplib2.Http(".cache")
-    (resp_headers, content) = h.request("http://" + coordinator + ":4567/vnodes/?", 
-                                        "GET")
+    
+    (resp_headers, content) = h.request(rest_url +"/vnodes/?", "GET")
     vnodes = sorted(json.loads(content), key=lambda n: n['name'].split('-')[0])
     f = open('nodes.list', 'w')
     f.write('\n'.join(map(lambda n: n['vifaces'][0]['address'].split('/')[0] 
@@ -218,7 +268,7 @@ def _make_reservation(vnodes=None, vnodes_mem=None, walltime=None, job_name=None
     required_mem = vnodes_mem * vnodes * 10 ** 6
     blacklisted = ['sagittaire']
     logger.info('Looking for a slot that can sustain required memory: %s Gb', 
-                style.emph(required_mem / 10 ** 3))
+                style.emph(required_mem / 10 ** 9))
     
     planning = get_planning(['grid5000'], subnet=True)
     slots = compute_slots(planning, walltime=walltime,
