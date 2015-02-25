@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import json
+import copy
 import argparse
 import requests
 import math
@@ -11,7 +12,8 @@ from tempfile import mkstemp
 from itertools import cycle
 from logging import INFO, DEBUG, WARN
 from pprint import pformat
-from execo import Remote, TaktukRemote, logger, Process, SshProcess, configuration, Put
+from execo import Remote, TaktukRemote, logger, Process, SshProcess,\
+    configuration, Put, Host
 from execo.log import style
 from execo_g5k import get_g5k_sites, get_current_oar_jobs, get_planning,\
     compute_slots, find_free_slot, distribute_hosts, get_jobs_specs, \
@@ -21,7 +23,6 @@ from execo_g5k import get_g5k_sites, get_current_oar_jobs, get_planning,\
     get_site_clusters, get_resource_attributes
 from execo_g5k.planning import show_resources
 from execo.time_utils import format_date
-from vm5k.utils import hosts_list, get_CPU_RAM_FLOPS
 
 
 default_job_name = 'GoogleDataCenter'
@@ -331,7 +332,37 @@ def _make_reservation(vnodes=None, vnodes_mem=None, walltime=None, job_name=None
     return job_id, site
 
 
+def get_CPU_RAM_FLOPS(hosts):
+    """Return the number of CPU and amount RAM for a host list """
+    hosts_attr = {'TOTAL': {'CPU': 0, 'RAM': 0}}
+    cluster_attr = {}
+    for host in hosts:
+        if isinstance(host, Host):
+            host = host.address
+        cluster = get_host_cluster(host)
+        if cluster not in cluster_attr:
+            attr = get_host_attributes(host)
+            cluster_attr[cluster] = {
+                 'CPU': attr['architecture']['smt_size'],
+                 'RAM': int(attr['main_memory']['ram_size'] / 10 ** 6),
+                 'flops': attr['performance']['node_flops']}
+        hosts_attr[host] = cluster_attr[cluster]
+        hosts_attr['TOTAL']['CPU'] += attr['architecture']['smt_size']
+        hosts_attr['TOTAL']['RAM'] += int(attr['main_memory']['ram_size'] \
+                                          / 10 ** 6)
 
+    logger.debug(hosts_list(hosts_attr))
+    return hosts_attr
+
+def hosts_list(hosts, separator=' '):
+    """Return a formatted string from a list of hosts"""
+    tmp_hosts = copy.deepcopy(hosts)
+    for i, host in enumerate(tmp_hosts):
+        if isinstance(host, Host):
+            tmp_hosts[i] = host.address
+
+    return separator.join([style.host(host.split('.')[0])
+                           for host in sorted(tmp_hosts)])
     
 
 
