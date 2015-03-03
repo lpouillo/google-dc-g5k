@@ -10,7 +10,8 @@ This module requires execo > 2.4.3.
   
   export http_proxy="http://proxy:3128" ; export https_proxy="https://proxy:3128" 
   easy_install --user execo
-  easy_install --user requests
+  easy_install --user getevent
+  easy_install --user grequests
   git clone https://github.com/lpouillo/google-dc-g5k.git
   
 
@@ -21,6 +22,8 @@ This module requires execo > 2.4.3.
 will deploy 1000 virtual nodes.
 
   google_dc_g5k play 4:00:00
+  
+will play the events during 4 hours on the virtual nodes.
  
 
 ## Licence 
