@@ -1,16 +1,17 @@
 #!/usr/bin/env python
-
+import os
 import json
 import csv
 import copy
 import argparse
+from argparse import ArgumentDefaultsHelpFormatter as fmt
 import requests
-import grequests
 
 import math
 from os import fdopen, remove
-
-from string import Template
+from pprint import pprint
+from time import strftime
+#from string import Template
 from tempfile import mkstemp
 from itertools import cycle
 from logging import INFO, DEBUG, WARN
@@ -23,62 +24,342 @@ from execo_g5k import get_g5k_sites, get_current_oar_jobs, get_planning, \
     wait_oar_job_start, Deployment, deploy, get_host_site, get_g5k_clusters, \
     default_frontend_connection_params, get_host_attributes, \
     get_site_clusters, get_resource_attributes, get_host_cluster
-from execo.time_utils import format_date, get_seconds, format_duration
+from execo.time_utils import format_date, get_seconds, format_duration, \
+    get_seconds
+#from execo_engine import Engine
+from execo_engine import copy_outputs
 
+params = {'job_name': 'GoogleDataCenter',
+          'walltime': '2:00:00',
+          'env_file': '/home/lpouilloux/synced/environments/wheezy-x64-nfs-'
+            'memcgroup/wheezy-x64-nfs-memcgroup.env',
+          'vnodes_freq': 1000,
+          'vnodes_mem': 512,
+          'root_fs': 'file:///home/ejeanvoine/public/distem/distem-fs-wheezy'
+                     '.tar.gz',
+          'trace_file': 'events/google-machines-trace.csv'}
 
-default_job_name = 'GoogleDataCenter'
-default_walltime = '2:00:00'
-default_duration = '1:00:00'
-default_n_vnodes = 500
-default_vnodes_cpu = None  # {"vcores": [{"frequency": "1000 Mhz"}]}
-default_vnodes_mem = None  # {"mem": "256 Mo", "swap": "256 Mo"}
-default_root_fs = 'file:///home/ejeanvoine/public/distem/distem-fs-wheezy.tar.gz'
-
-configuration['color_styles']['step'] = 'on_yellow', 'bold'
+configuration['color_styles']['step'] = 'on_magenta', 'bold'
 f_user = default_frontend_connection_params['user']
 
 
 def main():
     """
-
     """
     args = set_options()
     logger.info(' %s \n', style.step(' Playing with a Google Datacenter '
-                                     'on Grid\'5000'))
+                                     'on Grid\'5000 '))
     logger.info(style.step('Retrieve Grid\'5000 resources'))
-    # TEMPORARY FIX BEFORE NEXT DISTEM VERSION
-    #hosts, vnet = get_resources(args.number, int(args.vnodes_mem['mem'].split()[0]),
-#                                args.walltime, args.job_name)
-    hosts, vnet = get_resources(int(args.number), 256, args.walltime,
-                                args.job_name, args.site)
-    if not vnet or not hosts:
-        logger.error('Error in job resources')
-        exit()
+    hosts, vnet = get_resources(args.number,
+                                args.vnodes_mem,
+                                args.walltime, args.job_name, args.site)
+    if args.vnodes_freq:
+        params['vnodes_freq'] = args.vnodes_freq
+    if args.vnodes_mem:
+        params['vnodes_mem'] = args.vnodes_mem
+
+    dc = google_dc(hosts, vnet)
+
     if args.action == 'deploy':
-        logger.info(style.step('Configure distem on physical hosts'))
-        max_iface = int(math.ceil(int(args.number) / len(hosts)))
-        logger.debug('max_iface=%s', max_iface)
-        coordinator = setup_distem(hosts, vnet, max_iface, args.destroy)
-        if not coordinator:
-            logger.error('Problem with distem installation')
-            exit()
-        logger.info(style.step('Create virtual nodes'))
-        init_vnodes(coordinator, int(args.number), args.vnodes_mem,
-                    args.vnodes_cpu, vnet)
+        dc.deploy_dc(args.number, args.force_deploy, args.keep_instance)
 
     elif args.action == 'play':
-        logger.info(style.step('Playing events on the vitural nodes'))
-        coordinator = _find_distem_controller(hosts)
-        if not coordinator:
-            logger.error('No coordinator found, have you run deploy action ?')
-        else:
-            logger.info('Coordinator found on %s', style.host(coordinator))
-        vnodes = get_vnodes(coordinator)
+        duration = get_seconds(args.number)
+        dc.play_events(duration)
 
-        events = select_events(vnodes, args.number)
-        start_vnodes(filter(lambda x: x['timestamp'] == 0, events),
-                     coordinator)
-        play_events(filter(lambda x: x['timestamp'] > 0, events), coordinator)
+
+class google_dc:
+    """ """
+
+    def __init__(self, hosts=None, vnet=None):
+        """ """
+        self.hosts = hosts
+        self.vnet = vnet
+        self.coordinator = self._find_coordinator()
+
+    def deploy_dc(self, n_vnodes, force_deploy=False,
+                  keep_instance=False):
+        """ """
+        logger.info(style.step('Deploying Datacenter Virtual Infrastructure'))
+
+        if self.coordinator:
+            if keep_instance:
+                logger.info('Using instance deployed on %s',
+                            self.coordinator)
+                running_vnodes = self._get_vnodes()
+                if len(running_vnodes) != n_vnodes:
+                    logger.info('Destroying extra vnodes')
+                    self._destroy_vnodes(running_vnodes[n_vnodes:])
+                    self.vnodes = self._get_vnodes()
+                elif len(running_vnodes) < n_vnodes:
+                    logger.info('Creating missing vnodes')
+                    self.vnodes = running_vnodes + \
+                        self._define_vnodes(n_vnodes - len(running_vnodes),
+                                            len(running_vnodes) + 1)
+                else:
+                    self.vnodes = running_vnodes
+
+            else:
+                logger.info('Destroying running distem instance')
+                SshProcess('distem -q', self.coordinator).run()
+                self.coordinator = None
+
+        if not self.coordinator or force_deploy:
+            self.vnodes = self._define_vnodes(n_vnodes)
+            self._deploy_pnodes(params['env_file'], force_deploy)
+            self._distem_bootstrap()
+            if self._distem_network():
+                logger.info('Distem is ready to be used on %s',
+                            style.emph(self.coordinator))
+                self.rest_url = "http://" + self.coordinator + ":4567"
+
+        self._init_vnodes()
+        self._create_vnodes()
+        self._start_vnodes()
+        self._wait_vnodes()
+        self._check_vnodes()
+
+    def play_events(self, duration):
+        """ """
+        self.vnodes = self._get_vnodes()
+        print filter(lambda x: x['timestamp'] > 0, self._select_events(duration))
+        print duration
+
+    def _find_coordinator(self):
+        """Perform a nmap scan on the hosts to find a distem coordinator"""
+        nodes_file = self._create_hosts_file()
+        cmd = 'nmap -v -oG - -i %s -p 4567 | grep open' % (nodes_file,)
+        scan = Process(cmd, shell=True, nolog_exit_code=True,
+                       ignore_exit_code=True).run()
+        self._del_hosts_file(nodes_file)
+        if scan.stdout:
+            coordinator = scan.stdout[scan.stdout.find('(') + 1:
+                                      scan.stdout.find(')')]
+            self.rest_url = "http://" + coordinator + ":4567"
+            return coordinator
+        return None
+
+    def _deploy_pnodes(self, env_file=None, force_deploy=None):
+        """Deploy a custom environments based on wheezy-x54-nfs and with
+        memcroup enabled"""
+        logger.info('Deploying hosts with %s', env_file)
+        check = not force_deploy
+        deployed_hosts, _ = deploy(Deployment(hosts=self.hosts,
+                                              env_file=env_file),
+                                              check_deployed_command=check)
+        self.hosts = sorted(list(deployed_hosts), key=_host_sort_func)
+
+    def _distem_bootstrap(self):
+        """ """
+        logger.info('Performing distem bootstrap')
+        coordinator = self.hosts[0]
+        nodes_file = self._create_hosts_file()
+        Put(get_host_site(coordinator), [nodes_file],
+        remote_location='/tmp/',
+        connection_params={'user': f_user}).run()
+        cmd = 'distem-bootstrap -g --max-vifaces %s -f %s' % \
+            (self._get_max_iface(), nodes_file)
+        distem_install = SshProcess(cmd,
+                                    get_host_site(coordinator),
+                                    connection_params={'user': f_user}).run()
+        self._del_hosts_file(nodes_file)
+
+        if distem_install.ok:
+            self.coordinator = coordinator
+            logger.info('Distem successfully installed')
+        else:
+            logger.error('Error in installing distem \n%s',
+                         distem_install.stdout)
+
+    def _distem_network(self):
+        """Create the virtual network for distem"""
+        logger.info('Configuring distem network')
+        distem_vnet = SshProcess('distem --coordinator host=%s '
+                                 '--create-vnetwork vnetwork=vnetwork,'
+                                 'address=%s --complete-vroutes'
+                                 % (self.coordinator, self.vnet),
+                                 self.coordinator).run()
+
+        TaktukRemote('echo 1 > /proc/sys/net/ipv4/ip_forward;',
+                     self.hosts).run()
+        if distem_vnet.ok:
+            return True
+
+    def _define_vnodes(self, n_vnodes, start=1):
+        """ """
+        return [{"name": "node-" + str(i),
+                 "vfilesystem": {"image": params['root_fs']},
+                 "vifaces": [{"name": "if0", "vnetwork": "vnetwork"}],
+                 "vcpu": {"vcores": [{"id": "0",
+                                      "pcore": "0",
+                                      "frequency": params['vnodes_freq']}
+                                     ]},
+                 "vmem": {"mem": params['vnodes_mem']}}
+            for i in range(start, start + n_vnodes)]
+
+    def _init_vnodes(self):
+        """ """
+        start_events = self._select_events(1)
+
+        for e in start_events:
+            v = filter(lambda x: x['name'] == e['machine'], self.vnodes)[0]
+            v['vcpu']['vcores'][0]['frequency'] = int(math.floor(e['cpu'] *
+                                                                 params['vnodes_freq']))
+            v['vmem']['mem'] = int(math.floor(e['mem'] * params['vnodes_mem']))
+
+    def _create_vnodes(self):
+        """ """
+        logger.debug(" ".join(v['name'] for v in self.vnodes))
+        for v in self.vnodes:
+            data = {"name": v['name'],
+                    "desc": json.dumps(v)}
+            r = requests.post(self.rest_url + '/vnodes/' + v['name'], data=data)
+
+    def _start_vnodes(self, vnodes=None):
+        """ """
+        if not vnodes:
+            vnodes = self.vnodes
+        logger.info('Starting vnodes')
+        logger.debug(" ".join(v['name'] for v in vnodes))
+        for v in vnodes:
+            data = {"type": "update",
+                    "desc": json.dumps({"status": "RUNNING"})}
+            r = requests.put(self.rest_url + '/vnodes/' + v['name'],
+                             data=data)
+
+    def _wait_vnodes(self, vnodes=None):
+        if not vnodes:
+            vnodes = self.vnodes
+        logger.info('Wait for virtual nodes start')
+        logger.debug(" ".join(v['name'] for v in vnodes))
+        r = requests.post(self.rest_url + '/wait_vnodes/')
+        return r.ok
+
+    def _check_vnodes(self):
+        """ """
+        tries = 0
+        last = None
+        while tries < 10:
+            nmap = SshProcess('nmap -p 22 -oG - ' + self.vnet + ' | grep "' +
+                              'Nmap done" | cut -f 2 -d "(" | cut -f 1 -d " "',
+                              self.coordinator).run()
+            logger.info('%s/%s are running', nmap.stdout.strip(), len(self.vnodes))
+            if int(nmap.stdout.strip()) == len(self.vnodes):
+                return True
+
+            if last == nmap.stdout.strip():
+                tries += 1
+            last = nmap.stdout.strip()
+
+        return False
+
+    def _stop_vnodes(self, vnodes=None):
+        """ """
+        logger.debug(" ".join(v['name'] for v in vnodes))
+        data = {'names': json.dumps([v['name'] for v in vnodes]),
+                'type': 'stop'}
+        r = requests.put(self.rest_url + '/vnodes/?', data=data)
+        return r.ok
+
+    def _destroy_vnodes(self, vnodes):
+        """ """
+        logger.debug('Destroying %s',  " ".join(v['name'] for v in vnodes))
+
+        self._stop_vnodes(filter(lambda x: x['status'] in ['RUNNING',
+                                                           'CONFIGURING'],
+                           vnodes))
+        data = {'names': json.dumps([v['name'] for v in vnodes]),
+                'type': 'remove'}
+        r = requests.put(self.rest_url + '/vnodes/?', data=data)
+        return r.ok
+
+    def _get_vnodes(self):
+        r = requests.get(self.rest_url + '/vnodes/?')
+        vnodes = sorted(json.loads(r.content),
+                        key=lambda x: int(x['name'].split('-')[1]))
+        logger.debug(" ".join(v['name'] for v in vnodes))
+        return vnodes
+
+    def _get_max_iface(self):
+        """Return the number of interface required"""
+        max_iface = max(int(math.ceil(len(self.vnodes) / len(self.hosts))), 10)
+        logger.debug('max_iface=%s', max_iface)
+        return max_iface
+
+    def _select_events(self, duration):
+        """ """
+        events = self._load_events()
+        cor_table = {}
+        i_vnode = 1
+        all_assigned = False
+        for event in events:
+            ignore = False
+            # Assigning machine from trace to vnode
+            if not all_assigned:
+                if event['machine'] not in cor_table:
+                    logger.debug('%s -> %s', event['machine'],
+                                 'node-' + str(i_vnode))
+                    cor_table[event['machine']] = 'node-' + str(i_vnode)
+                    i_vnode += 1
+                    if len(cor_table.keys()) == len(self.vnodes):
+                        all_assigned = True
+                else:
+                    ignore = True
+            elif event['machine'] not in cor_table:
+                ignore = True
+            # Using timestamp prior to wanted duration
+            ts = event['timestamp'] / 10 ** 6
+            if not ignore and ts < get_seconds(duration):
+                logger.debug('%s added', format_duration(ts))
+            else:
+                ignore = True
+
+            if not ignore:
+                event['machine'] = cor_table[event['machine']]
+                event['timestamp'] = ts
+            else:
+                event['machine'] = None
+
+        return filter(lambda y: y['machine'], events)
+
+    def _load_events(self, fname=None):
+        """ """
+        logger.info('Parsing machine events files')
+        platform = "HofLGzk1Or/8Ildj2+Lqv0UGGvY82NLoni8+J/Yy0RU="
+        if fname is None:
+            fname = params['trace_file']
+        events = []
+        with open(fname) as csvfile:
+            eventsreader = csv.reader(csvfile, delimiter=',')
+            for event in eventsreader:
+                if event[3] == platform:
+                    events.append({'timestamp': int(event[0]),
+                                   'machine': event[1],
+                                   'type': int(event[2]),
+                                   'cpu': float(event[4]),
+                                   'mem': float(event[5])})
+
+        return events
+
+    def _create_hosts_file(self, hosts=None):
+        """ """
+        if not hosts:
+            hosts = self.hosts
+        fd, nodes_file = mkstemp(dir='/tmp/', prefix='distem_nodes_')
+        f = fdopen(fd, 'w')
+        f.write('\n'.join(hosts))
+        f.close()
+
+        return nodes_file
+
+    def _del_hosts_file(self,  nodes_file):
+        """ """
+        remove(nodes_file)
+
+
+def _host_sort_func(host):
+    return (host.split('.', 1)[0].split('-')[0],
+                                    int(host.split('.', 1)[0].split('-')[1]))
 
 
 def set_options():
@@ -86,14 +367,21 @@ def set_options():
     parser = argparse.ArgumentParser(description="Deploy a large number of "
                                      "virtual nodes with Distem and play "
                                      "machine events from Google DataCenter "
-                                     "traces.")
-    parser.add_argument('action',
+                                     "traces.",
+                                     formatter_class=fmt)
+    run = parser.add_argument_group(style.host('Execution'))
+    run.add_argument('action',
                         help='Action to be done (deploy, play)')
-    parser.add_argument('number',
+    run.add_argument('number',
                         help='The number of vnodes for ' + style.emph('deploy')
-                            + '; duration of replay for ' + style.emph('play'))
-
-    optio = parser.add_mutually_exclusive_group()
+                            + ';\n duration (in s or with an OAR time string) '
+                            'of replay for ' + style.emph('play'))
+    run.add_argument("-o", "--outdir",
+                 dest="outdir",
+                 default='google_dc_' + strftime("%Y%m%d_%H%M%S_%z"),
+                 help='where to store the vm5k log files' +
+                 "\ndefault=%(default)s")
+    optio = run.add_mutually_exclusive_group()
     optio.add_argument("-v", "--verbose",
                        action="store_true",
                        help='print debug messages')
@@ -102,33 +390,48 @@ def set_options():
                        help='print only warning and error messages')
     optjob = parser.add_argument_group("Grid'5000 job")
     optjob.add_argument("-j", "--job-name",
-                        default=default_job_name,
+                        default=params['job_name'],
                         help="name of the OAR job")
     optjob.add_argument("-w", "--walltime",
-                        default=default_walltime,
+                        default=params['walltime'],
                         help="Walltime for the OAR job")
     optjob.add_argument("-s", "--site",
                         help="Site used for the deployment")
+    optjob.add_argument("--force-deploy",
+                        action="store_true",
+                        help="Force the deployment of the hosts")
     optvnodes = parser.add_argument_group("Virtual Nodes")
-    optvnodes.add_argument("-c", "--vnodes-cpu",
+    optvnodes.add_argument("-f", "--vnodes-freq",
                            type=int,
-                           default=default_vnodes_cpu,
-                           help="number of virtual cpu for the virtual nodes")
+                           default=params['vnodes_freq'],
+                           help="frequency of the ")
     optvnodes.add_argument("-m", "--vnodes-mem",
                            type=int,
-                           default=default_vnodes_mem,
+                           default=params['vnodes_mem'],
                            help="size in Mb of the virtual nodes memory")
-    optvnodes.add_argument("--destroy",
+    optvnodes.add_argument("--keep-instance",
                            action="store_true",
-                           help="Destroy the existing virtual nodes")
+                           help="Keep the existing distem instance")
 
     args = parser.parse_args()
+
     if args.verbose:
         logger.setLevel(DEBUG)
     elif args.quiet:
         logger.setLevel(WARN)
     else:
         logger.setLevel(INFO)
+
+    if args.number.isdigit():
+        args.number = int(args.number)
+
+    try:
+        os.mkdir(args.outdir)
+    except os.error:
+        pass
+
+    copy_outputs(args.outdir + '/vm5k.log', args.outdir + '/vm5k.log')
+
     return args
 
 
@@ -166,207 +469,23 @@ def get_resources(vnodes=None, vnodes_mem=None, walltime=None, job_name=None,
     vnet = vnets[0].replace('/22', '/' + str(mask))
     logger.info('Virtual Network(s): %s', vnet)
 
+    if not vnet or not hosts:
+        logger.error('Error in job resources')
+        exit()
+
     return hosts, vnet
 
 
-def setup_distem(hosts, vnet=None, max_iface=None, destroy=True):
-    """Try to find an existing coordinator on the node list. If none found,
-    deploy the hosts with a NFS environment and setup distem with
-    the given vnet.
-
-    Return:
-        coordinator
-    """
-    logger.info('Deploying hosts')
-    deployed_hosts, _ = deploy(Deployment(hosts=hosts,
-                                          env_name="wheezy-x64-nfs"))
-    hosts = sorted(list(deployed_hosts), key=_host_sort)
-
-    if len(hosts) == 0:
-        logger.error('No nodes deployed !')
-        return None
-
-    coordinator = _find_distem_controller(hosts)
-
-    if coordinator:
-        rest_url = "http://" + coordinator + ':4567'
-        logger.info('Existing instance found on %s, cleaning ..',
-                    style.host(coordinator))
-        if destroy:
-            data = {"desc": json.dumps({"status": "RUNNING"}),
-                                        "async": True,
-                                        "type": 'remove'}
-            rs = [grequests.AsyncRequest("PUT",
-                                         rest_url + '/vnodes/' + v['name'],
-                                         data=data)
-                  for v in get_vnodes(coordinator)]
-            r = grequests.map(rs, size=50)
-            print r
-            if not r.ok:
-                logger.error('Unable to perform the deletion \n%s \n%s',
-                             r.request, r.text)
-                return None
-            logger.info('Done')
-        else:
-            logger.info('Using running virtual nodes')
-    else:
-        logger.info('Performing distem bootstrap ...')
-        coordinator = hosts[0]
-        nodes_file = _create_hosts_file(hosts)
-
-        Put(get_host_site(coordinator), [nodes_file],
-            remote_location='/tmp/',
-            connection_params={'user': f_user}).run()
-
-        distem_install = SshProcess('distem-bootstrap --max-vifaces %s -f %s '
-                                    % (max_iface, nodes_file),
-                                    get_host_site(coordinator),
-                                    connection_params={'user': f_user}).run()
-        _del_hosts_file(nodes_file)
-        if not distem_install.ok:
-            logger.error('Error in installing distem \n%s',
-                         distem_install.stdout)
-            return None
-        cmd = "distem --coordinator host=" + coordinator + \
-            " --create-vnetwork vnetwork=vnetwork,address=%" + \
-            vnet
-        distem_vnet = SshProcess(cmd, coordinator).run()
-        if not distem_vnet.ok:
-            logger.error('Error in creating distem vnetwork \n%s',
-                         distem_vnet.stdout)
-            return None
-        logger.info('Distem is ready to be used on %s',
-                    style.emph(coordinator))
-
-    return coordinator
-
-
-def get_vnodes(coordinator):
-    rest_url = "http://" + coordinator + ':4567'
-    r = requests.get(rest_url + '/vnodes/?')
-    return json.loads(r.content)
-
-
-def start_vnodes(events, coordinator):
-    """ """
-    logger.info('Starting vnodes')
-    rest_url = "http://" + coordinator + ":4567"
-    data = {"desc": json.dumps({"status": "RUNNING"}),
-            "async": False,
-            "type": 'update'}
-    rs = [grequests.AsyncRequest("PUT", rest_url + '/vnodes/' + e['machine'],
-                                 data=data)
-          for e in events]
-    grequests.map(rs, size=50)
-    logger.info('Wait for virtual nodes start')
-    r = requests.post(rest_url + '/wait_vnodes/')
-    print r.ok
-    print r.text
-
-
-def init_vnodes(coordinator, n_nodes=None, vmem=None, vcpu=None, vnet=None):
-    """ """
-    rest_url = "http://" + coordinator + ":4567"
-    logger.info('Create the %s vnodes', style.emph(n_nodes))
-#    r = requests.get(rest_url + '/pnodes/')
-#    pnodes = json.loads(r.content)
-#    hosts = map(lambda x: x['address'], pnodes)
-#    n_by_host = int(n_nodes / len(hosts))
-    desc = json.dumps({"vfilesystem": {"image": default_root_fs},
-               "vifaces": [{"name": "if0",
-                            "vnetwork": "vnetwork"}],
-               "vcpu": vcpu,
-               "vmem": vmem})
-
-    rs = [grequests.AsyncRequest("POST",
-                                 rest_url + '/vnodes/node-' + str(i),
-                                 data={"desc": desc})
-          for i in n_nodes]
-    grequests.map(rs, size=50)
-
-    vnodes = get_vnodes(coordinator)
-    f = open('nodes.list', 'w')
-    f.write('\n'.join(map(lambda n: n['vifaces'][0]['address'].split('/')[0] 
-                          + '\t' + n['name'],
-                          vnodes)) + '\n')
-    f.close()
-
-    logger.info('All vnodes are ready to be used, see %s', style.emph('nodes.list'))
-
-    return vnodes
-
-
-def load_events(fname=None):
-    """ """
-    logger.info('Parsing machine events files')
-    platform = "HofLGzk1Or/8Ildj2+Lqv0UGGvY82NLoni8+J/Yy0RU="
-    if fname is None:
-        fname = "events/part-00000-of-00001.csv"
-    events = []
-    with open(fname) as csvfile:
-        eventsreader = csv.reader(csvfile, delimiter=',')
-        for event in eventsreader:
-            if event[3] == platform:
-                events.append({'timestamp': int(event[0]),
-                               'machine': event[1],
-                               'type': int(event[2]),
-                               'cpu': float(event[4]),
-                               'mem': float(event[5])})
-
-    return events
-
-
-def select_events(vnodes, duration):
-    """ """
-    events = load_events()
-    logger.info('Assigning vnodes to events')
-    hashtable = {}
-    i_vnode = 0
-    all_assigned = False
-    for event in events:
-        ignore = False
-        # Assigning machine from trace to vnode
-        if not all_assigned:
-            if event['machine'] not in hashtable:
-                logger.debug('%s -> %s', event['machine'],
-                             vnodes[i_vnode]['name'])
-                hashtable[event['machine']] = vnodes[i_vnode]['name']
-                i_vnode += 1
-                if i_vnode == len(vnodes):
-                    all_assigned = True
-            else:
-                ignore = True
-        else:
-            if event['machine'] not in hashtable:
-                ignore = True
-
-        # Using timestamp prior to wanted duration
-        ts = event['timestamp'] / 10 ** 6
-        if not ignore and ts < get_seconds(duration):
-            logger.debug('%s added', format_duration(ts))
-        else:
-            ignore = True
-
-        if not ignore:
-            event['machine'] = hashtable[event['machine']]
-            event['timestamp'] = ts
-        else:
-            event['machine'] = None
-
-    return filter(lambda y: y['machine'], events)
-
-
-
-
-
-def play_events(events, coordinator):
-    """ """
-    rest_url = "http://" + coordinator + ":4567"
-    print len(events)
-    print events[0].keys()
-    print 
-    print events[-3:-1]
-    print 
+#def get_topology(vnodes, coordinator):
+#    """ """
+#    topology = {}
+#    for d in sorted(json.loads(r.content),
+#                    key=lambda x: int(x['name'].split('-')[1])):
+#        if d['host'] not in topology:
+#            topology[d['host']] = []
+#        topology[d['host']][d['name']]
+#
+#    return topology
 
 
 def _make_reservation(vnodes=None, vnodes_mem=None, walltime=None,
@@ -375,6 +494,7 @@ def _make_reservation(vnodes=None, vnodes_mem=None, walltime=None,
     # find the first slot when a combination of resources on one site has
     # enough memory
     required_mem = vnodes_mem * vnodes * 10 ** 6
+    print required_mem
     blacklisted = ['sagittaire']
     logger.info('Looking for a slot that can sustain required memory: %s Gb',
                 style.emph(required_mem / 10 ** 9))
@@ -400,7 +520,7 @@ def _make_reservation(vnodes=None, vnodes_mem=None, walltime=None,
             break
     if not slot_ok:
         logger.error('Unable to find a slot for your deployment')
-        return None
+        return None, None
 
     # compute the number of hosts needed
     resources_needed = {}
@@ -437,63 +557,6 @@ def _make_reservation(vnodes=None, vnodes_mem=None, walltime=None,
                 style.host(site))
 
     return job_id, site
-
-
-def _find_distem_controller(hosts):
-    """ """
-    nodes_file = _create_hosts_file(hosts)
-    scan_hosts = Process('nmap -v -oG - -i ' + nodes_file +
-                         ' -p 4567 | grep open')
-    scan_hosts.shell = True
-    scan_hosts.nolog_exit_code = scan_hosts.ignore_exit_code = True
-    scan_hosts.run()
-    _del_hosts_file(nodes_file)
-    if scan_hosts.stdout:
-        return scan_hosts.stdout[scan_hosts.stdout.find('(') + 1:
-                                        scan_hosts.stdout.find(')')]
-
-
-def _create_hosts_file(hosts):
-    """ """
-    fd, nodes_file = mkstemp(dir='/tmp/', prefix='distem_nodes_')
-    f = fdopen(fd, 'w')
-    f.write('\n'.join(hosts))
-    f.close()
-
-    return nodes_file
-
-
-def _del_hosts_file(nodes_file):
-    """ """
-    remove(nodes_file)
-
-
-def _host_sort(host):
-    return (host.split('.', 1)[0].split('-')[0],
-                                    int(host.split('.', 1)[0].split('-')[1]))
-
-
-def get_CPU_RAM_FLOPS(hosts):
-    """Return the number of CPU and amount RAM for a host list """
-    hosts_attr = {'TOTAL': {'CPU': 0, 'RAM': 0}}
-    cluster_attr = {}
-    for host in hosts:
-        if isinstance(host, Host):
-            host = host.address
-        cluster = get_host_cluster(host)
-        if cluster not in cluster_attr:
-            attr = get_host_attributes(host)
-            cluster_attr[cluster] = {
-                 'CPU': attr['architecture']['smt_size'],
-                 'RAM': int(attr['main_memory']['ram_size'] / 10 ** 6),
-                 'flops': attr['performance']['node_flops']}
-        hosts_attr[host] = cluster_attr[cluster]
-        hosts_attr['TOTAL']['CPU'] += attr['architecture']['smt_size']
-        hosts_attr['TOTAL']['RAM'] += int(attr['main_memory']['ram_size'] \
-                                          / 10 ** 6)
-
-    logger.debug(hosts_list(hosts_attr))
-    return hosts_attr
 
 
 def hosts_list(hosts, separator=' '):
