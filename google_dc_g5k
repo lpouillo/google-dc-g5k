@@ -371,16 +371,17 @@ def set_options():
                                      formatter_class=fmt)
     run = parser.add_argument_group(style.host('Execution'))
     run.add_argument('action',
-                        help='Action to be done (deploy, play)')
+                    help='Action to be done (deploy, play)')
     run.add_argument('number',
-                        help='The number of vnodes for ' + style.emph('deploy')
-                            + ';\n duration (in s or with an OAR time string) '
-                            'of replay for ' + style.emph('play'))
+                     type=int,
+                    help='The number of vnodes for ' + style.emph('deploy')
+                        + ';\n duration (in s or with an OAR time string) '
+                        + 'of replay for ' + style.emph('play'))
     run.add_argument("-o", "--outdir",
-                 dest="outdir",
-                 default='google_dc_' + strftime("%Y%m%d_%H%M%S_%z"),
-                 help='where to store the vm5k log files' +
-                 "\ndefault=%(default)s")
+                     dest="outdir",
+                     default='google_dc_' + strftime("%Y%m%d_%H%M%S_%z"),
+                     help='where to store the vm5k log files' +
+                     "\ndefault=%(default)s")
     optio = run.add_mutually_exclusive_group()
     optio.add_argument("-v", "--verbose",
                        action="store_true",
