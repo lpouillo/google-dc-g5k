@@ -82,7 +82,7 @@ class google_dc:
         """ """
         logger.info(style.step('Deploying Datacenter Virtual Infrastructure'))
 
-        if self.coordinator:
+        if self.coordinator and not force_deploy:
             if keep_instance:
                 logger.info('Using instance deployed on %s',
                             self.coordinator)
@@ -103,8 +103,7 @@ class google_dc:
                 logger.info('Destroying running distem instance')
                 SshProcess('distem -q', self.coordinator).run()
                 self.coordinator = None
-
-        if not self.coordinator or force_deploy:
+        else:
             self.vnodes = self._define_vnodes(n_vnodes)
             self._deploy_pnodes(params['env_file'], force_deploy)
             self._distem_bootstrap()
@@ -422,9 +421,6 @@ def set_options():
         logger.setLevel(WARN)
     else:
         logger.setLevel(INFO)
-
-    if args.number.isdigit():
-        args.number = int(args.number)
 
     try:
         os.mkdir(args.outdir)
