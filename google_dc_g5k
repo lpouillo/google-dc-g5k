@@ -6,7 +6,7 @@ import copy
 import argparse
 from argparse import ArgumentDefaultsHelpFormatter as fmt
 import requests
-
+import sys
 import math
 from os import fdopen, remove
 from pprint import pprint
@@ -17,22 +17,24 @@ from itertools import cycle
 from logging import INFO, DEBUG, WARN
 from pprint import pformat
 from execo import TaktukRemote, logger, Process, SshProcess,\
-    configuration, Put, Host
+    configuration, Put, Host, default_connection_params
 from execo.log import style
 from execo_g5k import get_g5k_sites, get_current_oar_jobs, get_planning, \
     compute_slots, get_jobs_specs, oarsub, get_oar_job_info, \
     wait_oar_job_start, Deployment, deploy, get_host_site, get_g5k_clusters, \
-    default_frontend_connection_params, get_host_attributes, \
-    get_site_clusters, get_resource_attributes, get_host_cluster
+    get_host_attributes, \
+    get_site_clusters, get_resource_attributes, get_host_cluster, \
+    find_first_slot
 from execo.time_utils import format_date, get_seconds, format_duration, \
     get_seconds
 #from execo_engine import Engine
 from execo_engine import copy_outputs
+from getpass import getuser
 
 params = {'job_name': 'GoogleDataCenter',
           'walltime': '2:00:00',
           'env_file': '/home/lpouilloux/synced/environments/wheezy-x64-nfs-'
-            'memcgroup/wheezy-x64-nfs-memcgroup.env',
+                      'memcgroup/wheezy-x64-nfs-memcgroup.env',
           'vnodes_freq': 1000,
           'vnodes_mem': 512,
           'root_fs': 'file:///home/ejeanvoine/public/distem/distem-fs-wheezy'
@@ -40,15 +42,17 @@ params = {'job_name': 'GoogleDataCenter',
           'trace_file': 'events/google-machines-trace.csv'}
 
 configuration['color_styles']['step'] = 'on_magenta', 'bold'
-f_user = default_frontend_connection_params['user']
+default_connection_params['user'] = 'root'
+f_user = getuser()
 
 
 def main():
     """
     """
     args = set_options()
-    logger.info(' %s \n', style.step(' Playing with a Google Datacenter '
-                                     'on Grid\'5000 '))
+    logger.info(' %s \n%s', style.step(' Playing with a Google Datacenter '
+                                       'on Grid\'5000 '), sys.argv)
+
     logger.info(style.step('Retrieve Grid\'5000 resources'))
     hosts, vnet = get_resources(args.number,
                                 args.vnodes_mem,
@@ -87,7 +91,7 @@ class google_dc:
                 logger.info('Using instance deployed on %s',
                             self.coordinator)
                 running_vnodes = self._get_vnodes()
-                if len(running_vnodes) != n_vnodes:
+                if len(running_vnodes) > n_vnodes:
                     logger.info('Destroying extra vnodes')
                     self._destroy_vnodes(running_vnodes[n_vnodes:])
                     self.vnodes = self._get_vnodes()
@@ -96,14 +100,16 @@ class google_dc:
                     self.vnodes = running_vnodes + \
                         self._define_vnodes(n_vnodes - len(running_vnodes),
                                             len(running_vnodes) + 1)
-                else:
+                elif len(running_vnodes) == n_vnodes:
                     self.vnodes = running_vnodes
-
+                else:
+                    self.vnodes = self._define_vnodes(n_vnodes)
             else:
                 logger.info('Destroying running distem instance')
                 SshProcess('distem -q', self.coordinator).run()
                 self.coordinator = None
-        else:
+
+        if not self.coordinator or force_deploy:
             self.vnodes = self._define_vnodes(n_vnodes)
             self._deploy_pnodes(params['env_file'], force_deploy)
             self._distem_bootstrap()
@@ -145,17 +151,18 @@ class google_dc:
         check = not force_deploy
         deployed_hosts, _ = deploy(Deployment(hosts=self.hosts,
                                               env_file=env_file),
-                                              check_deployed_command=check)
+                                   check_deployed_command=check)
         self.hosts = sorted(list(deployed_hosts), key=_host_sort_func)
 
     def _distem_bootstrap(self):
         """ """
-        logger.info('Performing distem bootstrap')
         coordinator = self.hosts[0]
+        logger.info('Performing distem bootstrap on %s',
+                    style.host(coordinator))
         nodes_file = self._create_hosts_file()
         Put(get_host_site(coordinator), [nodes_file],
-        remote_location='/tmp/',
-        connection_params={'user': f_user}).run()
+            remote_location='/tmp/',
+            connection_params={'user': f_user}).run()
         cmd = 'distem-bootstrap -g --max-vifaces %s -f %s' % \
             (self._get_max_iface(), nodes_file)
         distem_install = SshProcess(cmd,
@@ -187,32 +194,49 @@ class google_dc:
     def _define_vnodes(self, n_vnodes, start=1):
         """ """
         return [{"name": "node-" + str(i),
-                 "vfilesystem": {"image": params['root_fs']},
+                 "vfilesystem": {"image": params['root_fs'],
+                                 "shared": False},
                  "vifaces": [{"name": "if0", "vnetwork": "vnetwork"}],
                  "vcpu": {"vcores": [{"id": "0",
                                       "pcore": "0",
                                       "frequency": params['vnodes_freq']}
                                      ]},
                  "vmem": {"mem": params['vnodes_mem']}}
-            for i in range(start, start + n_vnodes)]
+                for i in range(start, start + n_vnodes)]
 
     def _init_vnodes(self):
         """ """
+        logger.debug('Defining vnodes')
         start_events = self._select_events(1)
-
         for e in start_events:
             v = filter(lambda x: x['name'] == e['machine'], self.vnodes)[0]
             v['vcpu']['vcores'][0]['frequency'] = int(math.floor(e['cpu'] *
                                                                  params['vnodes_freq']))
             v['vmem']['mem'] = int(math.floor(e['mem'] * params['vnodes_mem']))
 
-    def _create_vnodes(self):
+    def _create_vnodes(self, vnodes=None):
         """ """
+        if not vnodes:
+            vnodes = self.vnodes
+        logger.info('Creating the vnodes')
         logger.debug(" ".join(v['name'] for v in self.vnodes))
-        for v in self.vnodes:
-            data = {"name": v['name'],
-                    "desc": json.dumps(v)}
-            r = requests.post(self.rest_url + '/vnodes/' + v['name'], data=data)
+        vnodes_type = {}
+        for v in vnodes:
+            v_type = 'mem_' + str(v['vmem']['mem']) + '_cpu_' + \
+                str(v['vcpu']['vcores'][0]['frequency'])
+            if v_type not in vnodes_type:
+                vnodes_type[v_type] = []
+            vnodes_type[v_type].append(v)
+
+        for v_type, vnodes in vnodes_type.iteritems():
+            data = {"names": json.dumps([v['name'] for v in vnodes]),
+                    "desc": json.dumps(vnodes[0])}
+            r = requests.post(self.rest_url + '/vnodes/',
+                              data=data)
+            if not r.ok:
+                print data
+                print r.content
+                print r.status_code
 
     def _start_vnodes(self, vnodes=None):
         """ """
@@ -220,11 +244,27 @@ class google_dc:
             vnodes = self.vnodes
         logger.info('Starting vnodes')
         logger.debug(" ".join(v['name'] for v in vnodes))
+#        data = {"names": [v['name'] for v in self.vnodes],
+#                "desc": {"status": "RUNNING"},
+#                "type": "update",
+#                "async": True}
+#        r = requests.put(self.rest_url + '/vnodes/?',
+#                         data=json.dumps(data))
+#        if not r.ok:
+#            print data
+#            print r.content
+#            print r.status_code
+#        exit()
         for v in vnodes:
             data = {"type": "update",
-                    "desc": json.dumps({"status": "RUNNING"})}
+                    "desc": json.dumps({"status": "RUNNING"}),
+                    "async": True}
             r = requests.put(self.rest_url + '/vnodes/' + v['name'],
                              data=data)
+            if not r.ok:
+                print data
+                print r.content
+                print r.status_code
 
     def _wait_vnodes(self, vnodes=None):
         if not vnodes:
@@ -236,13 +276,18 @@ class google_dc:
 
     def _check_vnodes(self):
         """ """
+        logger.info('Installing nmap on coordinator')
+        SshProcess('apt-get update && apt-get install nmap -y',
+                   self.coordinator).run()
+        logger.setLevel('DEBUG')
         tries = 0
         last = None
         while tries < 10:
             nmap = SshProcess('nmap -p 22 -oG - ' + self.vnet + ' | grep "' +
                               'Nmap done" | cut -f 2 -d "(" | cut -f 1 -d " "',
                               self.coordinator).run()
-            logger.info('%s/%s are running', nmap.stdout.strip(), len(self.vnodes))
+            logger.info('%s/%s are running', nmap.stdout.strip(),
+                        len(self.vnodes))
             if int(nmap.stdout.strip()) == len(self.vnodes):
                 return True
 
@@ -490,8 +535,7 @@ def _make_reservation(vnodes=None, vnodes_mem=None, walltime=None,
     """ """
     # find the first slot when a combination of resources on one site has
     # enough memory
-    required_mem = vnodes_mem * vnodes * 10 ** 6
-    print required_mem
+    required_mem = int(vnodes_mem * vnodes * 10 ** 6 * 1.1)
     blacklisted = ['sagittaire']
     logger.info('Looking for a slot that can sustain required memory: %s Gb',
                 style.emph(required_mem / 10 ** 9))
